@@ -93,7 +93,7 @@
     "@alcalzone/ansi-tokenize": "0.3.1",
     "@anthropic-ai/bedrock-sdk": "0.36.0",
     "@anthropic-ai/foundry-sdk": "0.6.0",
-    "@anthropic-ai/sandbox-runtime": "0.0.55",
+    "@anthropic-ai/sandbox-runtime": "0.0.81",
     "@anthropic-ai/sdk": "0.137.0",
     "@aws-sdk/client-bedrock": "3.1156.0",
     "@aws-sdk/client-sts": "3.1156.0",
