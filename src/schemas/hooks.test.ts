@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   BashCommandHook,
@@ -7,6 +10,8 @@ import {
 } from './hooks.js'
 import { PluginHooksSchema } from '../utils/plugins/schemas.js'
 import { SettingsSchema } from '../utils/settings/types.js'
+import { parseSettingsFile } from '../utils/settings/settings.js'
+import { validateSettingsFileContent } from '../utils/settings/validation.js'
 
 const validCommandHook = {
   type: 'command',
@@ -107,6 +112,60 @@ describe('command hook schema rejects a supplied args field', () => {
       url: 'https://example.invalid/hook',
     })
     expect(http.success).toBe(true)
+  })
+})
+
+describe('settings diagnostics for unsupported command hook args', () => {
+  const settingsContent = (hook: Record<string, unknown>) => JSON.stringify({
+    hooks: { UserPromptSubmit: [{ hooks: [hook] }] },
+  })
+
+  test('settings loading preserves the explanation and rejects the file', () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'hook-args-diagnostic-'))
+    const settingsPath = join(fixtureDir, 'settings.json')
+    try {
+      writeFileSync(settingsPath, settingsContent({
+        type: 'command', command: 'sh', args: ['-c', 'cat'],
+      }))
+      const result = parseSettingsFile(settingsPath)
+      expect(result.settings).toBeNull()
+      expect(result.errors).toHaveLength(1)
+      expect(result.errors[0]?.path).toBe('hooks.UserPromptSubmit.0.hooks.0.args')
+      expect(result.errors[0]?.message).toContain('do not support an "args" field')
+      expect(result.errors[0]?.message).toContain('complete invocation in "command"')
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true })
+    }
+  })
+
+  test('settings edit validation explains every supplied JSON args value', () => {
+    for (const args of [null, [], ['--flag'], '', 'value', 0, false, {}]) {
+      const result = validateSettingsFileContent(settingsContent({
+        type: 'command', command: 'sh', args,
+      }))
+      expect(result.isValid).toBe(false)
+      if (!result.isValid) {
+        expect(result.error).toContain('hooks.UserPromptSubmit.0.hooks.0.args')
+        expect(result.error).toContain('do not support an "args" field')
+        expect(result.error).toContain('complete invocation in "command"')
+      }
+    }
+  })
+
+  test('a complete command remains valid through both settings paths', () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'hook-command-valid-'))
+    const settingsPath = join(fixtureDir, 'settings.json')
+    const content = settingsContent(validCommandHook)
+    try {
+      writeFileSync(settingsPath, content)
+      const result = parseSettingsFile(settingsPath)
+      expect(result.errors).toEqual([])
+      expect(result.settings?.hooks?.UserPromptSubmit?.[0]?.hooks[0])
+        .toEqual(validCommandHook)
+      expect(validateSettingsFileContent(content)).toEqual({ isValid: true })
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true })
+    }
   })
 })
 

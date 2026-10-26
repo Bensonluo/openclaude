@@ -142,7 +142,9 @@ export function formatZodError(
     if (isInvalidValueIssue(issue)) {
       expected = enumValues?.map(v => `"${v}"`).join(', ')
       message = `Invalid value. Expected one of: ${expected}`
-    } else if (isInvalidTypeIssue(issue)) {
+    } else if (isInvalidTypeIssue(issue) && issue.expected !== 'never') {
+      // Forbidden fields use the schema's explanation of what to remove or
+      // replace; treating `never` as an ordinary type loses that guidance.
       const receivedType =
         extractReceivedFromMessage(issue.message) ??
         getReceivedType(issue.input)
