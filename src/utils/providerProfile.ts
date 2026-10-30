@@ -1,5 +1,5 @@
 import { getGeminiVertexProjectId, geminiVertexAdcWillResolveProject } from './geminiAuth.js'
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
@@ -65,9 +65,32 @@ export const DEFAULT_STARTUP_PROVIDER_ENV_VAR =
 
 export const PROFILE_ORCAROUTER_KEY_SHA256 =
   'CLAUDE_CODE_PROVIDER_PROFILE_ORCAROUTER_KEY_SHA256'
+export const PROFILE_RUNCRATE_KEY_SHA256 =
+  'CLAUDE_CODE_PROVIDER_PROFILE_RUNCRATE_KEY_SHA256'
+// Provenance marker for the OPENAI_AUTH_* trio. A child inherits this with the
+// trio, so a retarget can tell profile-managed auth from an explicit shell
+// credential without comparing values that may have changed since the profile
+// was saved.
+export const PROFILE_OPENAI_AUTH_MANAGED =
+  'CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED'
+
+// Credential-keyed fingerprint for provenance tracking, not password storage:
+// it only answers "did this env key come from the saved profile", and must stay
+// deterministic because a relaunched child compares it against the env it
+// inherited. Keying the digest by the credential keeps it one-way without
+// treating the value as a password.
+function managedCredentialFingerprint(value: string): string {
+  return createHmac('sha256', sanitizeApiKey(value)?.trim() ?? '')
+    .update('openclaude:managed-credential-fingerprint:v1')
+    .digest('hex')
+}
 
 export function orcarouterCredentialFingerprint(value: string): string {
   return createHash('sha256').update(sanitizeApiKey(value)?.trim() ?? '').digest('hex')
+}
+
+export function runcrateCredentialFingerprint(value: string): string {
+  return managedCredentialFingerprint(value)
 }
 
 export function isManagedOrcarouterCredential(env: NodeJS.ProcessEnv): boolean {
@@ -77,9 +100,16 @@ export function isManagedOrcarouterCredential(env: NodeJS.ProcessEnv): boolean {
   return !!key && env[PROFILE_ORCAROUTER_KEY_SHA256] === orcarouterCredentialFingerprint(key)
 }
 
+export function isManagedRuncrateCredential(env: NodeJS.ProcessEnv): boolean {
+  const key = sanitizeApiKey(env.RUNCRATE_API_KEY)
+  return !!key && env[PROFILE_RUNCRATE_KEY_SHA256] === runcrateCredentialFingerprint(key)
+}
+
 const PROFILE_ENV_KEYS = [
   'CLAUDE_CODE_USE_GEMINI_VERTEX',
   PROFILE_ORCAROUTER_KEY_SHA256,
+  PROFILE_RUNCRATE_KEY_SHA256,
+  PROFILE_OPENAI_AUTH_MANAGED,
   'CLAUDE_CODE_USE_OPENAI',
   'CLAUDE_CODE_USE_GITHUB',
   'CLAUDE_CODE_USE_GEMINI',
@@ -137,6 +167,7 @@ const PROFILE_ENV_KEYS = [
   'ATLAS_CLOUD_API_KEY',
   'GMI_API_KEY',
   'ORCAROUTER_API_KEY',
+  'RUNCRATE_API_KEY',
   'APISMART_API_KEY',
   'APISMART_MODEL',
   'API_ROUTE_API_KEY',
@@ -197,6 +228,7 @@ export type ProviderProfile =
 
 export type ProfileEnv = {
   CLAUDE_CODE_PROVIDER_PROFILE_ORCAROUTER_KEY_SHA256?: string
+  CLAUDE_CODE_PROVIDER_PROFILE_RUNCRATE_KEY_SHA256?: string
   ANTHROPIC_BASE_URL?: string
   ANTHROPIC_MODEL?: string
   ANTHROPIC_API_KEY?: string
@@ -245,6 +277,7 @@ export type ProfileEnv = {
   ATLAS_CLOUD_API_KEY?: string
   GMI_API_KEY?: string
   ORCAROUTER_API_KEY?: string
+  RUNCRATE_API_KEY?: string
   APISMART_API_KEY?: string
   API_ROUTE_API_KEY?: string
   CLINE_API_KEY?: string
@@ -1090,6 +1123,9 @@ export function buildOpenAIProfileEnv(options: {
       : {}),
     ...(resolveRouteIdFromBaseUrl(resolvedBaseUrl) === 'orcarouter' && key
       ? { ORCAROUTER_API_KEY: key }
+      : {}),
+    ...(resolveRouteIdFromBaseUrl(resolvedBaseUrl) === 'runcrate' && key
+      ? { RUNCRATE_API_KEY: key }
       : {}),
     OPENAI_BASE_URL: resolvedBaseUrl,
     OPENAI_MODEL: normalizedModel,
@@ -2192,15 +2228,59 @@ export async function buildLaunchEnv(options: {
   } else {
     delete env.OPENAI_AUTH_HEADER_VALUE
   }
+  // Record when the effective trio came wholly from the saved profile. A
+  // canonical relaunch then carries this marker to its children, so a later
+  // retarget can drop the saved trio even after its values change. An env that
+  // already inherited the marker is not treating its trio as explicit shell
+  // auth, even though the values arrive through processEnv.
+  const inheritedOpenAIAuthProvenance =
+    processEnv[PROFILE_OPENAI_AUTH_MANAGED] === '1'
+  const shellSuppliedOpenAIAuth =
+    !inheritedOpenAIAuthProvenance &&
+    (!!processEnv.OPENAI_AUTH_HEADER ||
+      processEnv.OPENAI_AUTH_SCHEME === 'bearer' ||
+      processEnv.OPENAI_AUTH_SCHEME === 'raw' ||
+      !!sanitizeApiKey(processEnv.OPENAI_AUTH_HEADER_VALUE))
+  if (
+    inheritedOpenAIAuthProvenance ||
+    (usePersistedOpenAIConfig &&
+      !shellSuppliedOpenAIAuth &&
+      (persistedOpenAIAuthHeader ||
+        persistedOpenAIAuthScheme ||
+        persistedOpenAIAuthHeaderValue))
+  ) {
+    env[PROFILE_OPENAI_AUTH_MANAGED] = '1'
+  }
   // A shell URL override must not carry a saved Merge key through its generic
   // alias after route resolution drops the original provider identity.
   const retargetedMergeProfile =
     (persistedEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID === 'merge-gateway' ||
       isCanonicalMergeGatewayInferenceBaseUrl(persistedOpenAIBaseUrl)) &&
     !isCanonicalMergeGatewayInferenceBaseUrl(env.OPENAI_BASE_URL)
+  // A saved Runcrate profile mirrors its dedicated key into the generic
+  // OPENAI_API_KEY alias. A shell URL retarget must not hand that saved key to
+  // the new endpoint; only an explicit shell credential may follow the URL.
+  const retargetedRuncrateProfile =
+    (persistedEnv.CLAUDE_CODE_PROVIDER_ROUTE_ID === 'runcrate' ||
+      resolveRouteIdFromBaseUrl(persistedOpenAIBaseUrl) === 'runcrate') &&
+    !isSameConfiguredEndpoint(env.OPENAI_BASE_URL, persistedOpenAIBaseUrl)
+  // A profile-applied Runcrate key also rides in the generic alias, and a pane
+  // can inherit it. Only a shell credential without Runcrate's managed marker
+  // may follow a retarget.
+  const shellCredentialSelection = resolveOpenAICredentialEnvSelection(processEnv)
+  const shellGenericIsManagedRuncrate =
+    retargetedRuncrateProfile &&
+    !!shellCredentialSelection &&
+    shellCredentialSelection.kind === 'usable' &&
+    isManagedRuncrateCredential(processEnv) &&
+    sanitizeApiKey(shellCredentialSelection.value) ===
+      sanitizeApiKey(processEnv.RUNCRATE_API_KEY)
+  const shellCredentialSource = shellGenericIsManagedRuncrate
+    ? { ...processEnv, OPENAI_API_KEY: undefined, OPENAI_API_KEYS: undefined }
+    : processEnv
   const openAICredential = resolveOpenAICredentialEnvOverride(
-    processEnv,
-    retargetedMergeProfile ? {} : persistedEnv,
+    shellCredentialSource,
+    retargetedMergeProfile || retargetedRuncrateProfile ? {} : persistedEnv,
   )
   if (openAICredential) {
     env[openAICredential.envVar] = openAICredential.value
@@ -2281,45 +2361,91 @@ export async function buildLaunchEnv(options: {
     isNoncanonicalMergeGatewayLaunch ||
     isNoncanonicalCommandcodeLaunch ||
     isNoncanonicalApiRouteLaunch
-  if (isNoncanonicalDedicatedOpenAILaunch) {
+  if (isNoncanonicalDedicatedOpenAILaunch || retargetedRuncrateProfile) {
     delete env.OPENAI_API_KEY
     delete env.OPENAI_API_KEYS
-    // AIMLAPI and ApiSmart may retain a user-configured proxy credential in
-    // their persisted generic OpenAI field. Concentrate is different: its
-    // dedicated credential is never valid off the canonical endpoint, and
-    // older profiles could have stored that same secret under either generic
-    // alias. Do not resurrect it for a noncanonical Concentrate launch.
-    if (
+    if (retargetedRuncrateProfile) {
+      // A retargeted launch keeps no identity for the endpoint it now points
+      // at, so only the explicit shell credential may follow it.
+      const shellCredential = resolveOpenAICredentialEnvSelection(shellCredentialSource)
+      if (shellCredential?.kind === 'usable') {
+        env[shellCredential.envVar] = shellCredential.value
+      }
+    } else if (
       !isNoncanonicalConcentrateLaunch &&
       !isNoncanonicalLlmtrLaunch &&
       !isNoncanonicalMergeGatewayLaunch &&
       !isNoncanonicalCommandcodeLaunch
     ) {
+      // AIMLAPI and ApiSmart may retain a user-configured proxy credential in
+      // their persisted generic OpenAI field. Concentrate is different: its
+      // dedicated credential is never valid off the canonical endpoint, and
+      // older profiles could have stored that same secret under either generic
+      // alias. Do not resurrect it for a noncanonical Concentrate launch.
       const persistedCredential = resolveOpenAICredentialEnvSelection(persistedEnv)
       if (persistedCredential) {
         env[persistedCredential.envVar] = persistedCredential.value
       }
     }
-    // Custom authentication is a second credential channel, not just transport
-    // metadata: the OpenAI shim sends OPENAI_AUTH_HEADER_VALUE as the request
-    // credential whenever OPENAI_AUTH_HEADER names a header. The selections
-    // above prefer the live shell value, so without this an ambient canonical
-    // secret would still reach the proxy through custom auth. Re-source the
-    // whole trio from the profile's OWN persisted env and drop ambient values;
-    // the three are applied as a unit so a shell header name can never activate
-    // a value the profile did not configure.
-    delete env.OPENAI_AUTH_HEADER
-    delete env.OPENAI_AUTH_SCHEME
-    delete env.OPENAI_AUTH_HEADER_VALUE
-    if (usePersistedOpenAIConfig) {
-      if (persistedOpenAIAuthHeader) {
-        env.OPENAI_AUTH_HEADER = persistedOpenAIAuthHeader
+    if (retargetedRuncrateProfile) {
+      // A retargeted launch keeps no saved custom-auth trio: it belongs to the
+      // endpoint the profile was saved for. Provenance comes from the marker a
+      // profile application wrote, not from the values themselves: the saved
+      // secret may have changed since this env was inherited. Only an env
+      // without the marker carries an explicit shell credential for the new
+      // endpoint.
+      delete env.OPENAI_AUTH_HEADER
+      delete env.OPENAI_AUTH_SCHEME
+      delete env.OPENAI_AUTH_HEADER_VALUE
+      delete env[PROFILE_OPENAI_AUTH_MANAGED]
+      const shellAuthInheritedFromProfile =
+        processEnv[PROFILE_OPENAI_AUTH_MANAGED] === '1'
+      if (!shellAuthInheritedFromProfile) {
+        if (processEnv.OPENAI_AUTH_HEADER) {
+          env.OPENAI_AUTH_HEADER = processEnv.OPENAI_AUTH_HEADER
+        }
+        if (
+          processEnv.OPENAI_AUTH_SCHEME === 'bearer' ||
+          processEnv.OPENAI_AUTH_SCHEME === 'raw'
+        ) {
+          env.OPENAI_AUTH_SCHEME = processEnv.OPENAI_AUTH_SCHEME
+        }
+        if (processEnv.OPENAI_AUTH_HEADER_VALUE) {
+          env.OPENAI_AUTH_HEADER_VALUE = processEnv.OPENAI_AUTH_HEADER_VALUE
+        }
       }
-      if (persistedOpenAIAuthScheme) {
-        env.OPENAI_AUTH_SCHEME = persistedOpenAIAuthScheme
-      }
-      if (persistedOpenAIAuthHeaderValue) {
-        env.OPENAI_AUTH_HEADER_VALUE = persistedOpenAIAuthHeaderValue
+    } else {
+      // Custom authentication is a second credential channel, not just transport
+      // metadata: the OpenAI shim sends OPENAI_AUTH_HEADER_VALUE as the request
+      // credential whenever OPENAI_AUTH_HEADER names a header. The selections
+      // above prefer the live shell value, so without this an ambient canonical
+      // secret would still reach the proxy through custom auth. Re-source the
+      // whole trio from the profile's OWN persisted env and drop ambient values;
+      // the three are applied as a unit so a shell header name can never activate
+      // a value the profile did not configure.
+      delete env.OPENAI_AUTH_HEADER
+      delete env.OPENAI_AUTH_SCHEME
+      delete env.OPENAI_AUTH_HEADER_VALUE
+      delete env[PROFILE_OPENAI_AUTH_MANAGED]
+      if (usePersistedOpenAIConfig) {
+        if (persistedOpenAIAuthHeader) {
+          env.OPENAI_AUTH_HEADER = persistedOpenAIAuthHeader
+        }
+        if (persistedOpenAIAuthScheme) {
+          env.OPENAI_AUTH_SCHEME = persistedOpenAIAuthScheme
+        }
+        if (persistedOpenAIAuthHeaderValue) {
+          env.OPENAI_AUTH_HEADER_VALUE = persistedOpenAIAuthHeaderValue
+        }
+        if (
+          persistedOpenAIAuthHeader ||
+          persistedOpenAIAuthScheme ||
+          persistedOpenAIAuthHeaderValue
+        ) {
+          // Record that this trio came from the profile so a descendant
+          // retarget can drop it even after the saved values change.
+          env[PROFILE_OPENAI_AUTH_MANAGED] = '1'
+        }
       }
     }
   }
@@ -2327,6 +2453,7 @@ export async function buildLaunchEnv(options: {
     'ATLAS_CLOUD_API_KEY',
     'GMI_API_KEY',
     'ORCAROUTER_API_KEY',
+    'RUNCRATE_API_KEY',
     'APISMART_API_KEY',
     'CONCENTRATE_API_KEY',
     'LLMTR_API_KEY',
@@ -2369,6 +2496,9 @@ export async function buildLaunchEnv(options: {
       continue
     }
     if (dedicatedKey === 'ORCAROUTER_API_KEY' && effectiveOpenAIRouteId !== 'orcarouter') {
+      continue
+    }
+    if (dedicatedKey === 'RUNCRATE_API_KEY' && effectiveOpenAIRouteId !== 'runcrate') {
       continue
     }
     if (dedicatedKey === 'CONCENTRATE_API_KEY' && effectiveOpenAIRouteId !== 'concentrate') {
@@ -2534,6 +2664,28 @@ export async function buildLaunchEnv(options: {
             ? sanitizeApiKey(persistedOpenAICredential.value)
             : undefined)
         : undefined
+    const persistedRuncrateProfileKey =
+      dedicatedKey === 'RUNCRATE_API_KEY' &&
+      !retargetedRuncrateProfile &&
+      effectiveOpenAIRouteId === 'runcrate' &&
+      resolveRouteIdFromBaseUrl(persistedOpenAIBaseUrl) === 'runcrate'
+        ? sanitizeApiKey(persistedEnv.RUNCRATE_API_KEY) ||
+          (persistedOpenAICredential?.kind === 'usable'
+            ? sanitizeApiKey(persistedOpenAICredential.value)
+            : undefined)
+        : undefined
+    // A retargeted Runcrate launch may only use an explicit shell credential;
+    // the saved profile key belongs to the endpoint it was saved for.
+    const persistedDedicatedKey =
+      retargetedRuncrateProfile && dedicatedKey === 'RUNCRATE_API_KEY'
+        ? undefined
+        : sanitizeApiKey(persistedEnv[dedicatedKey])
+    const shellDedicatedKey =
+      retargetedRuncrateProfile &&
+      dedicatedKey === 'RUNCRATE_API_KEY' &&
+      isManagedRuncrateCredential(processEnv)
+        ? undefined
+        : sanitizeApiKey(processEnv[dedicatedKey])
     const dedicatedValue = withholdAmbientDedicatedKey
       ? sanitizeApiKey(persistedEnv[dedicatedKey])
       : backfillDedicatedFromOpenAI ||
@@ -2541,8 +2693,9 @@ export async function buildLaunchEnv(options: {
         persistedMergeGatewayProfileKey ||
         persistedCommandcodeProfileKey ||
         persistedOrcarouterProfileKey ||
-        sanitizeApiKey(processEnv[dedicatedKey]) ||
-        sanitizeApiKey(persistedEnv[dedicatedKey]) ||
+        persistedRuncrateProfileKey ||
+        shellDedicatedKey ||
+        persistedDedicatedKey ||
         backfillLegacyApismartProfileKey ||
         backfillLegacyConcentrateProfileKey
     if (dedicatedValue) {
@@ -2551,6 +2704,11 @@ export async function buildLaunchEnv(options: {
         (persistedOrcarouterProfileKey ||
           (!sanitizeApiKey(processEnv.ORCAROUTER_API_KEY) && persistedEnv.ORCAROUTER_API_KEY))) {
         env[PROFILE_ORCAROUTER_KEY_SHA256] = orcarouterCredentialFingerprint(dedicatedValue)
+      }
+      if (dedicatedKey === 'RUNCRATE_API_KEY' &&
+        (persistedRuncrateProfileKey ||
+          (!sanitizeApiKey(processEnv.RUNCRATE_API_KEY) && persistedEnv.RUNCRATE_API_KEY))) {
+        env[PROFILE_RUNCRATE_KEY_SHA256] = runcrateCredentialFingerprint(dedicatedValue)
       }
     }
   }
@@ -2567,9 +2725,13 @@ export async function buildLaunchEnv(options: {
   // and is sent on every request. So an ambient value must be withheld from a
   // non-canonical aimlapi/apismart launch exactly like the API key and the
   // custom-auth trio; only headers the profile itself persisted are restored.
-  const customHeaders = isNoncanonicalDedicatedOpenAILaunch
-    ? persistedCustomHeaders
-    : shellCustomHeaders || persistedCustomHeaders
+  // A retargeted Runcrate launch keeps no headers either: both ambient and
+  // persisted values belong to the endpoint the profile was saved for.
+  const customHeaders = retargetedRuncrateProfile
+    ? undefined
+    : isNoncanonicalDedicatedOpenAILaunch
+      ? persistedCustomHeaders
+      : shellCustomHeaders || persistedCustomHeaders
   if (customHeaders) {
     env.ANTHROPIC_CUSTOM_HEADERS = customHeaders
   } else {
@@ -2745,10 +2907,18 @@ export function applyProfileEnvToProcessEnv(
     sanitizeApiKey(targetEnv.ORCAROUTER_API_KEY) === sanitizeApiKey(nextEnv.ORCAROUTER_API_KEY)
       ? targetEnv[PROFILE_ORCAROUTER_KEY_SHA256]
       : undefined
+  const retainedRuncrateOrigin =
+    isManagedRuncrateCredential(targetEnv) &&
+    sanitizeApiKey(targetEnv.RUNCRATE_API_KEY) === sanitizeApiKey(nextEnv.RUNCRATE_API_KEY)
+      ? targetEnv[PROFILE_RUNCRATE_KEY_SHA256]
+      : undefined
   clearManagedProfileEnv(targetEnv)
   Object.assign(targetEnv, nextEnv)
   if (retainedOrcarouterOrigin) {
     targetEnv[PROFILE_ORCAROUTER_KEY_SHA256] = retainedOrcarouterOrigin
+  }
+  if (retainedRuncrateOrigin) {
+    targetEnv[PROFILE_RUNCRATE_KEY_SHA256] = retainedRuncrateOrigin
   }
 }
 

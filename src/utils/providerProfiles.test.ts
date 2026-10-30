@@ -25,7 +25,9 @@ const originalFetch = globalThis.fetch
 const RESTORED_KEYS = [
   'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED',
   'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID',
+  'CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED',
   'CLAUDE_CODE_PROVIDER_PROFILE_ORCAROUTER_KEY_SHA256',
+  'CLAUDE_CODE_PROVIDER_PROFILE_RUNCRATE_KEY_SHA256',
   'CLAUDE_CODE_PROVIDER_ROUTE_ID',
   'CLAUDE_CONFIG_DIR',
   'OPENCLAUDE_CONFIG_DIR',
@@ -87,6 +89,7 @@ const RESTORED_KEYS = [
   'ATLAS_CLOUD_API_KEY',
   'GMI_API_KEY',
   'ORCAROUTER_API_KEY',
+  'RUNCRATE_API_KEY',
   'APISMART_API_KEY',
   'APISMART_MODEL',
   'API_ROUTE_API_KEY',
@@ -408,6 +411,34 @@ describe('applyProviderProfileToProcessEnv', () => {
     expect(process.env.CLAUDE_CODE_USE_OPENAI).toBe('1')
     expect(process.env.OPENAI_BASE_URL).toBe('https://models.example.com/v1')
     expect(process.env.CLAUDE_CODE_PROVIDER_ROUTE_ID).toBe('ollama')
+  }, 20_000)
+
+  test('marks a profile-managed OPENAI_AUTH_* trio for retarget provenance', async () => {
+    const { applyProviderProfileToProcessEnv } =
+      await importFreshProviderProfileModules()
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({
+        provider: 'openai',
+        apiKey: 'saved-key',
+        authHeader: 'X-Proxy-Key',
+        authScheme: 'raw',
+        authHeaderValue: 'saved-secret',
+      }),
+    )
+
+    expect(process.env.CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED).toBe('1')
+    expect(process.env.OPENAI_AUTH_HEADER).toBe('X-Proxy-Key')
+    expect(process.env.OPENAI_AUTH_SCHEME).toBe('raw')
+    expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBe('saved-secret')
+
+    applyProviderProfileToProcessEnv(
+      buildProfile({ provider: 'openai', apiKey: 'saved-key' }),
+    )
+    expect(process.env.CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED).toBeUndefined()
+    expect(process.env.OPENAI_AUTH_HEADER).toBeUndefined()
+    expect(process.env.OPENAI_AUTH_SCHEME).toBeUndefined()
+    expect(process.env.OPENAI_AUTH_HEADER_VALUE).toBeUndefined()
   }, 20_000)
 
   test('LLMTR profile clears an ambient dedicated key so its saved key wins', async () => {
@@ -6560,3 +6591,284 @@ for (const provider of ['orcarouter', 'openai']) {
     })).toBe('selected-orca-key')
   })
 }
+
+test('keyless canonical Runcrate profile retains the dedicated shell credential', async () => {
+  const { applyProviderProfileToProcessEnv } = await importFreshProviderProfileModules()
+  process.env.RUNCRATE_API_KEY = 'ambient-runcrate-key'
+  const saved = buildProfile({
+    provider: 'openai', baseUrl: 'https://api.runcrate.ai/v1',
+    model: 'deepseek-ai/DeepSeek-V4.1-Flash', apiKey: undefined,
+  })
+  applyProviderProfileToProcessEnv(saved)
+  expect(resolveRouteCredentialValue({
+    routeId: 'runcrate', baseUrl: saved.baseUrl,
+  })).toBe('ambient-runcrate-key')
+  applyProviderProfileToProcessEnv(saved)
+  expect(process.env.RUNCRATE_API_KEY).toBe('ambient-runcrate-key')
+  applyProviderProfileToProcessEnv({ ...saved, baseUrl: 'https://custom.example/v1' })
+  expect(process.env.RUNCRATE_API_KEY).toBeUndefined()
+})
+
+// Removing a saved Runcrate key must not let the stale managed credential keep
+// authenticating the keyless selection that follows it.
+test.each([false, true])('a keyless Runcrate selection rejects another profile key (generic removed: %s)', async removeGeneric => {
+  const { setActiveProviderProfile } = await importFreshProviderProfileModules()
+  const keyed = buildProfile({ id: 'keyed-runcrate', provider: 'runcrate',
+    baseUrl: 'https://api.runcrate.ai/v1', model: 'deepseek-ai/DeepSeek-V4.1-Flash',
+    apiKey: 'account-a-key' })
+  const keyless = { ...keyed, id: 'keyless-runcrate', apiKey: undefined }
+  saveMockGlobalConfig(current => ({ ...current, providerProfiles: [keyed, keyless] }))
+  setActiveProviderProfile(keyed.id, { configDir: testConfigDir! })
+  if (removeGeneric) delete process.env.OPENAI_API_KEY
+  setActiveProviderProfile(keyless.id, { configDir: testConfigDir! })
+  expect(process.env.RUNCRATE_API_KEY).toBeUndefined()
+  expect(resolveRouteCredentialValue({ routeId: 'runcrate', baseUrl: keyless.baseUrl }))
+    .toBeUndefined()
+  const persisted = JSON.parse(readFileSync(join(testConfigDir!, '.openclaude-profile.json'), 'utf8'))
+  expect(persisted.env.RUNCRATE_API_KEY).toBeUndefined()
+})
+
+for (const provider of ['runcrate', 'openai']) {
+  test(`${provider} Runcrate profile owns its credential through apply, persist and relaunch`, async () => {
+    const { setActiveProviderProfile, applyActiveProviderProfileFromConfig } =
+      await importFreshProviderProfileModules()
+    const saved = buildProfile({
+      provider, apiKey: 'selected-runcrate-key',
+      baseUrl: 'https://api.runcrate.ai/v1', model: 'deepseek-ai/DeepSeek-V4.1-Flash',
+    })
+    saveMockGlobalConfig(current => ({ ...current, providerProfiles: [saved] }))
+    process.env.RUNCRATE_API_KEY = 'ambient-parent-key'
+    setActiveProviderProfile(saved.id, { configDir: testConfigDir! })
+    expect(resolveRouteCredentialValue({
+      routeId: 'runcrate', baseUrl: saved.baseUrl,
+    })).toBe('selected-runcrate-key')
+    process.env.RUNCRATE_API_KEY = 'drifted-key'
+    expect(applyActiveProviderProfileFromConfig()?.id).toBe(saved.id)
+    expect(process.env.RUNCRATE_API_KEY).toBe('selected-runcrate-key')
+
+    const persisted = JSON.parse(readFileSync(
+      join(testConfigDir!, '.openclaude-profile.json'), 'utf8',
+    ))
+    expect(persisted.env.RUNCRATE_API_KEY).toBe('selected-runcrate-key')
+    const { buildStartupEnvFromProfile, runcrateCredentialFingerprint } =
+      await import('./providerProfile.js')
+    const env = await buildStartupEnvFromProfile({
+      persisted, processEnv: { RUNCRATE_API_KEY: 'other-ambient-key' },
+    })
+    expect(resolveRouteCredentialValue({
+      routeId: 'runcrate', baseUrl: saved.baseUrl, processEnv: env,
+    })).toBe('selected-runcrate-key')
+
+    // A shell URL retarget must not forward the saved key to another endpoint.
+    const retargeted = await buildStartupEnvFromProfile({
+      persisted,
+      processEnv: { OPENAI_BASE_URL: 'https://other-endpoint.example/v1' },
+    })
+    expect(retargeted.RUNCRATE_API_KEY).toBeUndefined()
+    expect(retargeted.OPENAI_API_KEY).toBeUndefined()
+    // An explicit shell credential still follows the retargeted endpoint.
+    const retargetedWithShellKey = await buildStartupEnvFromProfile({
+      persisted,
+      processEnv: {
+        OPENAI_BASE_URL: 'https://other-endpoint.example/v1',
+        OPENAI_API_KEY: 'shell-key',
+      },
+    })
+    expect(retargetedWithShellKey.OPENAI_API_KEY).toBe('shell-key')
+    expect(retargetedWithShellKey.RUNCRATE_API_KEY).toBeUndefined()
+    // A pane that inherited this profile's managed credential must not carry
+    // it through the dedicated or generic alias either.
+    const inherited = await buildStartupEnvFromProfile({
+      persisted,
+      processEnv: {
+        OPENAI_BASE_URL: 'https://other-endpoint.example/v1',
+        RUNCRATE_API_KEY: 'selected-runcrate-key',
+        OPENAI_API_KEY: 'selected-runcrate-key',
+        CLAUDE_CODE_PROVIDER_PROFILE_RUNCRATE_KEY_SHA256:
+          runcrateCredentialFingerprint('selected-runcrate-key'),
+      },
+    })
+    expect(inherited.OPENAI_API_KEY).toBeUndefined()
+    expect(inherited.RUNCRATE_API_KEY).toBeUndefined()
+    // A noncanonical AIMLAPI launch is also a retarget, not a proxy relaunch.
+    const retargetedAimlapi = await buildStartupEnvFromProfile({
+      persisted,
+      processEnv: { OPENAI_BASE_URL: 'https://api.aimlapi.com/proxy' },
+    })
+    expect(retargetedAimlapi.OPENAI_API_KEY).toBeUndefined()
+    for (const proxyBaseUrl of [
+      'https://gw.apismart.ai/proxy',
+      'https://global.api-route.com/proxy',
+    ]) {
+      const retargetedProxy = await buildStartupEnvFromProfile({
+        persisted,
+        processEnv: {
+          OPENAI_BASE_URL: proxyBaseUrl,
+          OPENAI_API_KEY: 'shell-key',
+        },
+      })
+      expect(retargetedProxy.OPENAI_API_KEY).toBe('shell-key')
+    }
+  })
+}
+
+test('a retargeted Runcrate launch never falls back to the persisted key', async () => {
+  const { buildStartupEnvFromProfile } = await import('./providerProfile.js')
+  // A saved route id can outlive a hand-edited/custom base URL. The canonical
+  // shell URL still resolves to Runcrate, so only the retarget guard keeps the
+  // saved key from following it.
+  const persisted = JSON.parse(JSON.stringify({
+    profile: 'openai',
+    env: {
+      CLAUDE_CODE_PROVIDER_ROUTE_ID: 'runcrate',
+      OPENAI_BASE_URL: 'https://saved-runcrate.example/v1',
+      OPENAI_MODEL: 'deepseek-ai/DeepSeek-V4.1-Flash',
+      RUNCRATE_API_KEY: 'saved-runcrate-key',
+      OPENAI_API_KEY: 'saved-runcrate-key',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Proxy-Auth: saved-secret',
+    },
+    createdAt: new Date().toISOString(),
+  }))
+  const env = await buildStartupEnvFromProfile({
+    persisted,
+    processEnv: {
+      OPENAI_BASE_URL: 'https://api.runcrate.ai/v1',
+      ANTHROPIC_CUSTOM_HEADERS: 'X-Proxy-Auth: inherited-secret',
+    },
+  })
+  expect(env.RUNCRATE_API_KEY).toBeUndefined()
+  expect(env.OPENAI_API_KEY).toBeUndefined()
+  // Custom headers are a credential channel too: neither the inherited nor the
+  // profile's saved value may follow the retargeted endpoint.
+  expect(env.ANTHROPIC_CUSTOM_HEADERS).toBeUndefined()
+})
+
+test('a retargeted Runcrate launch drops the saved custom-auth trio', async () => {
+  const { buildStartupEnvFromProfile } = await import('./providerProfile.js')
+  const persisted = JSON.parse(JSON.stringify({
+    profile: 'openai',
+    env: {
+      CLAUDE_CODE_PROVIDER_ROUTE_ID: 'runcrate',
+      OPENAI_BASE_URL: 'https://saved-runcrate.example/v1',
+      OPENAI_MODEL: 'deepseek-ai/DeepSeek-V4.1-Flash',
+      RUNCRATE_API_KEY: 'saved-runcrate-key',
+      OPENAI_API_KEY: 'saved-runcrate-key',
+      OPENAI_AUTH_HEADER: 'X-Proxy-Auth',
+      OPENAI_AUTH_SCHEME: 'raw',
+      OPENAI_AUTH_HEADER_VALUE: 'saved-auth-secret',
+    },
+    createdAt: new Date().toISOString(),
+  }))
+  const retargetBaseUrl = 'https://other-endpoint.example/v1'
+  const retargeted = await buildStartupEnvFromProfile({
+    persisted,
+    processEnv: { OPENAI_BASE_URL: retargetBaseUrl },
+  })
+  // Values saved for the Runcrate endpoint never follow the retarget.
+  expect(retargeted.OPENAI_AUTH_HEADER).toBeUndefined()
+  expect(retargeted.OPENAI_AUTH_SCHEME).toBeUndefined()
+  expect(retargeted.OPENAI_AUTH_HEADER_VALUE).toBeUndefined()
+
+  // A pane that inherited the trio from a profile must not forward it, even
+  // when the profile's saved secret has since changed. Provenance comes from
+  // the managed marker, not from comparing values.
+  const inherited = await buildStartupEnvFromProfile({
+    persisted,
+    processEnv: {
+      OPENAI_BASE_URL: retargetBaseUrl,
+      CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED: '1',
+      OPENAI_AUTH_HEADER: 'X-Old-Proxy-Auth',
+      OPENAI_AUTH_SCHEME: 'bearer',
+      OPENAI_AUTH_HEADER_VALUE: 'old-profile-secret',
+    },
+  })
+  expect(inherited.OPENAI_AUTH_HEADER).toBeUndefined()
+  expect(inherited.OPENAI_AUTH_SCHEME).toBeUndefined()
+  expect(inherited.OPENAI_AUTH_HEADER_VALUE).toBeUndefined()
+
+  // Changing only the secret is an explicit shell credential when no profile
+  // marker is present, even though the header name and scheme match the saved
+  // profile.
+  const changedSecret = await buildStartupEnvFromProfile({
+    persisted,
+    processEnv: {
+      OPENAI_BASE_URL: retargetBaseUrl,
+      OPENAI_AUTH_HEADER: 'X-Proxy-Auth',
+      OPENAI_AUTH_SCHEME: 'raw',
+      OPENAI_AUTH_HEADER_VALUE: 'new-shell-secret',
+    },
+  })
+  expect(changedSecret.OPENAI_AUTH_HEADER).toBe('X-Proxy-Auth')
+  expect(changedSecret.OPENAI_AUTH_SCHEME).toBe('raw')
+  expect(changedSecret.OPENAI_AUTH_HEADER_VALUE).toBe('new-shell-secret')
+
+  // An explicitly supplied shell trio still follows the new endpoint.
+  const explicit = await buildStartupEnvFromProfile({
+    persisted,
+    processEnv: {
+      OPENAI_BASE_URL: retargetBaseUrl,
+      OPENAI_AUTH_HEADER: 'X-Shell-Auth',
+      OPENAI_AUTH_SCHEME: 'bearer',
+      OPENAI_AUTH_HEADER_VALUE: 'shell-auth-secret',
+    },
+  })
+  expect(explicit.OPENAI_AUTH_HEADER).toBe('X-Shell-Auth')
+  expect(explicit.OPENAI_AUTH_SCHEME).toBe('bearer')
+  expect(explicit.OPENAI_AUTH_HEADER_VALUE).toBe('shell-auth-secret')
+})
+
+test('a canonical Runcrate restore marks its auth trio for child retargets', async () => {
+  const { buildLaunchEnv, buildStartupEnvFromProfile } =
+    await import('./providerProfile.js')
+  const persisted = JSON.parse(JSON.stringify({
+    profile: 'openai',
+    env: {
+      CLAUDE_CODE_PROVIDER_ROUTE_ID: 'runcrate',
+      OPENAI_BASE_URL: 'https://api.runcrate.ai/v1',
+      OPENAI_MODEL: 'deepseek-ai/DeepSeek-V4.1-Flash',
+      RUNCRATE_API_KEY: 'saved-runcrate-key',
+      OPENAI_API_KEY: 'saved-runcrate-key',
+      OPENAI_AUTH_HEADER: 'X-Proxy-Auth',
+      OPENAI_AUTH_SCHEME: 'raw',
+      OPENAI_AUTH_HEADER_VALUE: 'saved-auth-secret',
+    },
+    createdAt: new Date().toISOString(),
+  }))
+  const canonical = await buildStartupEnvFromProfile({
+    persisted,
+    processEnv: {},
+  })
+  expect(canonical.OPENAI_AUTH_HEADER).toBe('X-Proxy-Auth')
+  expect(canonical.OPENAI_AUTH_SCHEME).toBe('raw')
+  expect(canonical.OPENAI_AUTH_HEADER_VALUE).toBe('saved-auth-secret')
+  expect(canonical.CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED).toBe('1')
+
+  // An intermediate canonical relaunch receives the trio through processEnv
+  // but must keep its profile-managed provenance.
+  const relaunched = await buildLaunchEnv({
+    profile: 'openai',
+    persisted,
+    goal: 'coding',
+    processEnv: canonical,
+  })
+  expect(relaunched.OPENAI_AUTH_HEADER).toBe('X-Proxy-Auth')
+  expect(relaunched.OPENAI_AUTH_SCHEME).toBe('raw')
+  expect(relaunched.OPENAI_AUTH_HEADER_VALUE).toBe('saved-auth-secret')
+  expect(relaunched.CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED).toBe('1')
+
+  // The child inherits the marker with the canonical env, so its retarget can
+  // drop the saved trio without guessing from the values.
+  const child = await buildLaunchEnv({
+    profile: 'openai',
+    persisted,
+    goal: 'coding',
+    processEnv: {
+      ...relaunched,
+      OPENAI_BASE_URL: 'https://other-endpoint.example/v1',
+    },
+  })
+  expect(child.OPENAI_AUTH_HEADER).toBeUndefined()
+  expect(child.OPENAI_AUTH_SCHEME).toBeUndefined()
+  expect(child.OPENAI_AUTH_HEADER_VALUE).toBeUndefined()
+  expect(child.CLAUDE_CODE_PROVIDER_PROFILE_OPENAI_AUTH_MANAGED).toBeUndefined()
+})

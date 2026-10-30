@@ -39,8 +39,12 @@ import {
   buildVertexProfileEnv,
   clearManagedProfileEnv,
   isManagedOrcarouterCredential,
+  isManagedRuncrateCredential,
   orcarouterCredentialFingerprint,
   PROFILE_ORCAROUTER_KEY_SHA256,
+  PROFILE_RUNCRATE_KEY_SHA256,
+  PROFILE_OPENAI_AUTH_MANAGED,
+  runcrateCredentialFingerprint,
   deleteProfileFile,
   type ProfileFileLocation,
   type ProfileEnv,
@@ -132,6 +136,19 @@ function rememberManagedOrcarouterCredential(
     // Inherit provenance with the applied markers: saved config can change
     // before a child starts, so it cannot reconstruct ownership from config.
     processEnv[PROFILE_ORCAROUTER_KEY_SHA256] = orcarouterCredentialFingerprint(value)
+  }
+}
+
+function rememberManagedRuncrateCredential(
+  profile: ProviderProfile,
+  processEnv: NodeJS.ProcessEnv = process.env,
+): void {
+  const value = sanitizeApiKey(profile.apiKey)?.trim()
+  if (value && resolveRouteIdFromBaseUrl(profile.baseUrl) === 'runcrate' &&
+    processEnv[PROFILE_ENV_APPLIED_FLAG] === '1' &&
+    trimOrUndefined(processEnv[PROFILE_ENV_APPLIED_ID]) === profile.id &&
+    sanitizeApiKey(processEnv.RUNCRATE_API_KEY)?.trim() === value) {
+    processEnv[PROFILE_RUNCRATE_KEY_SHA256] = runcrateCredentialFingerprint(value)
   }
 }
 
@@ -885,6 +902,9 @@ function getHostDedicatedCredentialEnv(
   if (apiKey && resolveRouteIdFromBaseUrl(baseUrl) === 'orcarouter') {
     env.ORCAROUTER_API_KEY = apiKey
   }
+  if (apiKey && resolveRouteIdFromBaseUrl(baseUrl) === 'runcrate') {
+    env.RUNCRATE_API_KEY = apiKey
+  }
   if (route?.routeId === 'xai' || isXaiBaseUrl(baseUrl)) {
     env.XAI_API_KEY = apiKey
   }
@@ -925,6 +945,11 @@ function hostDedicatedCredentialsAligned(
   if (!profile.apiKey &&
     resolveRouteIdFromBaseUrl(profile.baseUrl) === 'orcarouter' &&
     isManagedOrcarouterCredential(processEnv)) {
+    return false
+  }
+  if (!profile.apiKey &&
+    resolveRouteIdFromBaseUrl(profile.baseUrl) === 'runcrate' &&
+    isManagedRuncrateCredential(processEnv)) {
     return false
   }
   const dedicated = getHostDedicatedCredentialEnv(
@@ -1307,6 +1332,13 @@ export function applyProviderProfileToProcessEnv(
         openAIProfileEnv.ORCAROUTER_API_KEY = ambientKey
       }
     }
+    if (!profile.apiKey &&
+      resolveRouteIdFromBaseUrl(normalizedProfileBaseUrl) === 'runcrate') {
+      const ambientKey = sanitizeApiKey(process.env.RUNCRATE_API_KEY)
+      if (ambientKey && !isManagedRuncrateCredential(process.env)) {
+        openAIProfileEnv.RUNCRATE_API_KEY = ambientKey
+      }
+    }
     const isAimlapiProfile =
       profile.provider === 'aimlapi' ||
       route.routeId === 'aimlapi' ||
@@ -1580,7 +1612,17 @@ export function applyProviderProfileToProcessEnv(
   Object.assign(process.env, nextEnv)
   process.env[PROFILE_ENV_APPLIED_FLAG] = '1'
   process.env[PROFILE_ENV_APPLIED_ID] = profile.id
+  if (
+    profile.authHeader ||
+    profile.authScheme ||
+    profile.authHeaderValue
+  ) {
+    // Mark the custom-auth trio as profile-managed so a retargeted launch can
+    // discard it without depending on the saved values staying unchanged.
+    process.env[PROFILE_OPENAI_AUTH_MANAGED] = '1'
+  }
   rememberManagedOrcarouterCredential(profile)
+  rememberManagedRuncrateCredential(profile)
 }
 
 export function applyActiveProviderProfileFromConfig(
@@ -1621,6 +1663,7 @@ export function applyActiveProviderProfileFromConfig(
   // Bootstrap older inherited environments while the matching saved keyed
   // record is available; new environments already carry their fingerprint.
   rememberManagedOrcarouterCredential(activeProfile, processEnv)
+  rememberManagedRuncrateCredential(activeProfile, processEnv)
 
   const isCurrentEnvProfileManaged =
     processEnv[PROFILE_ENV_APPLIED_FLAG] === '1' &&
@@ -1739,6 +1782,7 @@ export function updateProviderProfile(
 
     wasUpdated = true
     rememberManagedOrcarouterCredential(currentProfiles[profileIndex]!)
+    rememberManagedRuncrateCredential(currentProfiles[profileIndex]!)
 
     const nextProfiles = [...currentProfiles]
     nextProfiles[profileIndex] = updatedProfile

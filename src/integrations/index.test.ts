@@ -71,6 +71,16 @@ describe('loaded registry validation', () => {
       // Virtual model — OrcaRouter's `orcarouter/auto` router resolves the
       // serving model server-side, so there is no concrete descriptor.
       'orcarouter:orcarouter-auto',
+      // Runcrate's DeepSeek, Qwen, and GPT-OSS entries serve third-party
+      // OpenAI-compatible model names (`deepseek-ai/DeepSeek-V4.1-Flash`,
+      // `Qwen/Qwen3.8-Flash`, `openai/gpt-oss-120b`) that do not map to a
+      // shared OpenClaude model descriptor, so they are exempt from the
+      // catalog-uses-shared-descriptors contract. Its GLM entries reference
+      // the shared `glm-5.3` / `glm-5.3-flash` descriptors via
+      // `modelDescriptorId`.
+      'runcrate:runcrate-deepseek-v4.1-flash',
+      'runcrate:runcrate-qwen3.8-flash',
+      'runcrate:runcrate-gpt-oss-120b',
       // Cloudflare Workers AI serves provider-specific quantized builds
       // (`@cf/...`) with no shared cross-provider model descriptor, the same
       // situation as azure-deployment above. See gateways/cloudflare.ts (#1100).

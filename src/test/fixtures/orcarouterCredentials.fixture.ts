@@ -103,18 +103,27 @@ if (scenario === 'shell-switch') {
   }
   finish({ headers, validation: await getProviderValidationError() })
 }
-if (scenario === 'pane') {
+if (scenario === 'pane' || scenario === 'pane-legacy-origin') {
   if (option === 'shell') {
     process.env.ORCAROUTER_API_KEY = 'shell-key'
     activate({ ...profile, apiKey: undefined })
   } else {
     activate()
+    if (scenario === 'pane-legacy-origin') {
+      // Pre-upgrade SHA-256 origin for the dummy "selected-key" credential.
+      // Keep this legacy input frozen, independent of current hashing code.
+      process.env.CLAUDE_CODE_PROVIDER_PROFILE_ORCAROUTER_KEY_SHA256 =
+        '4af900489429183b065f3cd1e46c59666642b54bed7c2a5a0c0566970992536e'
+    }
     if (option === 'replacement') process.env.ORCAROUTER_API_KEY = 'replacement-shell-key'
   }
+  const childScenario = scenario === 'pane-legacy-origin' || option
+    ? 'pane-keyless-child'
+    : 'pane-child'
   // An existing tmux login shell has none of the leader's provider credentials.
   const child = Bun.spawnSync(['/bin/sh', '-c',
     'env ' + buildInheritedEnvVars() + ' ' +
-    quote([process.execPath, import.meta.path, option ? 'pane-keyless-child' : 'pane-child', provider]),
+    quote([process.execPath, import.meta.path, childScenario, provider]),
   ], {
     env: Object.fromEntries([
       'PATH', 'NODE_ENV', 'TMPDIR', 'TMP', 'TEMP', 'CARGO_TARGET_DIR', 'GOCACHE',
