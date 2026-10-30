@@ -104,6 +104,16 @@ let rememberedProviderFlag:
     }
   | null = null
 
+const PROFILE_ENV_APPLIED_ID = 'CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED_ID'
+
+let rememberedModelFlag:
+  | {
+      model: string
+      profileId: string
+      routeIdentity: string
+    }
+  | null = null
+
 /**
  * Extract the value of --provider from argv.
  * Returns null if the flag is absent or has no value.
@@ -298,6 +308,9 @@ function usableProviderModelEnvValue(
  */
 export function applyModelFlagFromArgs(
   args: string[],
+  options?: {
+    rememberForSettingsEnv?: boolean
+  },
 ): { error?: string } | undefined {
   if (parseProviderFlag(args)) return
   const model = parseModelFlag(args)
@@ -314,6 +327,60 @@ export function applyModelFlagFromArgs(
     if (error) return { error }
   }
 
+  applyModelToActiveProviderEnv(effectiveModel)
+  if (options?.rememberForSettingsEnv) {
+    const profileId = process.env[PROFILE_ENV_APPLIED_ID]?.trim()
+    // Only saved profiles need replay to undo their model being restored by
+    // settings merges. An absent ID cannot identify an env-only provider.
+    rememberedModelFlag = profileId &&
+      process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED === '1'
+      ? { model: effectiveModel, profileId, routeIdentity: getModelFlagRouteIdentity() }
+      : null
+  }
+
+  return {}
+}
+
+// Settings env merges re-apply the active saved profile, which restores the
+// profile's model over a standalone --model (#2388). Restore the flag only
+// while the original profile AND route are active: editing a profile can keep
+// its ID while changing the endpoint or protocol that accepts the model.
+export function reapplyRememberedModelFlag(): void {
+  if (!rememberedModelFlag) return
+  const profileId = process.env[PROFILE_ENV_APPLIED_ID]?.trim() || undefined
+  if (
+    process.env.CLAUDE_CODE_PROVIDER_PROFILE_ENV_APPLIED !== '1' ||
+    profileId !== rememberedModelFlag.profileId ||
+    getModelFlagRouteIdentity() !== rememberedModelFlag.routeIdentity
+  ) return
+  applyModelToActiveProviderEnv(rememberedModelFlag.model)
+}
+
+function getModelFlagRouteIdentity(): string {
+  // Route IDs alone cannot distinguish two custom endpoints. Exclude model
+  // defaults and credentials so ordinary profile reconciliation/key rotation
+  // still restores the startup override on the same route.
+  return JSON.stringify([
+    resolveActiveRouteIdFromEnv(process.env),
+    PROVIDER_SELECTION_FLAGS.map(flag => isEnvTruthy(process.env[flag])),
+    process.env.OPENAI_BASE_URL,
+    process.env.OPENAI_API_BASE,
+    process.env.OPENAI_API_FORMAT,
+    process.env.OPENAI_AZURE_STYLE,
+    process.env.ANTHROPIC_BASE_URL,
+    process.env.ANTHROPIC_BEDROCK_BASE_URL,
+    process.env.ANTHROPIC_VERTEX_BASE_URL,
+    process.env.GEMINI_BASE_URL,
+    process.env.MISTRAL_BASE_URL,
+    process.env.GITHUB_ENTERPRISE_URL,
+  ])
+}
+
+export function clearRememberedModelFlagForTests(): void {
+  rememberedModelFlag = null
+}
+
+function applyModelToActiveProviderEnv(effectiveModel: string): void {
   const useGeminiVertex = isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI_VERTEX)
   const useGemini = isEnvTruthy(process.env.CLAUDE_CODE_USE_GEMINI)
   const useMistral = isEnvTruthy(process.env.CLAUDE_CODE_USE_MISTRAL)
@@ -331,8 +398,6 @@ export function applyModelFlagFromArgs(
   } else {
     process.env.ANTHROPIC_MODEL = effectiveModel
   }
-
-  return {}
 }
 
 /**
