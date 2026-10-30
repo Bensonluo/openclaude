@@ -45,6 +45,7 @@ import {
   setSessionSettingsCache,
 } from '../../utils/settings/settingsCache.js'
 import type { RenderInput } from './ctx-noninteractive.js'
+import { createCompactBoundaryMessage, createUserMessage } from '../../utils/messages.js'
 
 function findCtx(commands: ReturnType<typeof getCommands> extends Promise<infer T> ? T : never) {
   return commands.find(c => c.name === 'ctx')
@@ -65,6 +66,64 @@ afterEach(() => {
 })
 
 describe('/ctx command surface (PR #1610)', () => {
+  test('collects the latest operation across preserved partial-compaction prefixes', async () => {
+    const realAnalyze = { ...await import('../../utils/analyzeContext.js') }
+    // Token accounting is independent of boundary selection and requires
+    // build-time prompt macros. Exercise the real collector and renderer.
+    mock.module('../../utils/analyzeContext.js', () => ({
+      ...realAnalyze,
+      analyzeContextUsage: async () => ({
+        categories: [], totalTokens: 0, percentage: 0, apiUsage: null,
+      }),
+    }))
+    try {
+      const { collectCtxData, renderCtxReport } = await import('./ctx-noninteractive.js')
+      const old = createCompactBoundaryMessage('auto', 10_000)
+      old.compactMetadata.autoCompactReason = 'message-count'
+      const kept = createUserMessage({ content: 'preserved context' })
+      const manual = createCompactBoundaryMessage('manual', 5000)
+      // Real prefix-preserving partial compaction anchors the kept chain to
+      // the new boundary; resume relinks that chain into the same order.
+      manual.compactMetadata.preservedSegment = {
+        headUuid: old.uuid, anchorUuid: manual.uuid, tailUuid: kept.uuid,
+      }
+      // Identity, rather than wall-clock ordering, distinguishes operations.
+      manual.timestamp = old.timestamp
+      const later = createCompactBoundaryMessage('auto', 6000)
+      later.compactMetadata.autoCompactReason = 'context-overflow'
+      const nested = createCompactBoundaryMessage('manual', 4000)
+      nested.compactMetadata.preservedSegment = {
+        headUuid: manual.uuid, anchorUuid: nested.uuid, tailUuid: kept.uuid,
+      }
+      const cases = [
+        { messages: [], expected: 'none' },
+        { messages: [old, kept], expected: 'automatic (message count)' },
+        { messages: [manual, old, kept], expected: 'manual' },
+        // Fullscreen scrollback contains the kept UUIDs before and after manual.
+        { messages: [old, kept, manual, old, kept], expected: 'manual' },
+        { messages: [nested, manual, old, kept], expected: 'manual' },
+        { messages: [manual, old, kept, later], expected: 'automatic (context-overflow recovery)' },
+      ]
+      for (const { messages, expected } of cases) {
+        const data = await collectCtxData({
+          messages,
+          getAppState: () => ({
+            toolPermissionContext: {
+              mode: 'default', additionalWorkingDirectories: new Map(), alwaysAllowRules: {},
+            },
+          }) as never,
+          options: {
+            mainLoopModel: 'claude-sonnet-4', tools: [], customSystemPrompt: 'Test prompt',
+            agentDefinitions: { activeAgents: [], allAgents: [] },
+          },
+        })
+        expect(renderCtxReport(data)).toContain(`Last compaction:    ${expected}`)
+      }
+    } finally {
+      mock.module('../../utils/analyzeContext.js', () => realAnalyze)
+    }
+  })
+
   test('is registered in the public COMMANDS list for normal users', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'oc-test-ctx-pub-'))
     try {
@@ -196,6 +255,7 @@ describe('/ctx command surface (PR #1610)', () => {
       autoCompactThreshold: 167_000,
       messageCountCompactAt: 200,
       messageCountHardCap: 1000,
+      lastCompaction: { trigger: 'auto', autoCompactReason: 'token-threshold' },
       maxOutput: { default: 32_000, upperLimit: 64_000 },
       canonicalName: 'claude-sonnet-4',
       autoCompactEnabled: true,
@@ -224,6 +284,7 @@ describe('/ctx command surface (PR #1610)', () => {
     expect(out).toContain('Window source:      default')
     expect(out).not.toContain('Model limit unknown')
     expect(out).toMatch(/Message-count at: +\S*200\S* messages \(hard cap 1000\)/)
+    expect(out).toContain('Last compaction:    automatic (token threshold)')
     // Current Context block + total.
     expect(out).toContain('Current Context (what the model sees)')
     expect(out).toContain('Total:')
@@ -257,7 +318,7 @@ describe('/ctx command surface (PR #1610)', () => {
     expect(out).not.toContain('System tools (deferred)')
   })
 
-  test('reports the context-window source and disabled compaction triggers', async () => {
+  test('reports the context-window source, disabled triggers, and last compaction', async () => {
     const mod = (await import(
       `./ctx-noninteractive.ts?render=${Date.now()}-${Math.random()}`
     )) as {
@@ -295,27 +356,53 @@ describe('/ctx command surface (PR #1610)', () => {
       linesAdded: 0,
       linesRemoved: 0,
       modelUsageMap: {},
-    } satisfies Omit<RenderInput, 'contextWindowSource' | 'messageCountCompactAt' | 'messageCountHardCap'>
+    } satisfies Omit<RenderInput, 'contextWindowSource' | 'messageCountCompactAt' | 'messageCountHardCap' | 'lastCompaction'>
 
     const fallback = mod.renderCtxReport({
       ...input,
       contextWindowSource: 'fallback',
       messageCountCompactAt: 1000,
       messageCountHardCap: 1000,
+      lastCompaction: null,
     })
     expect(fallback).toContain('Window source:      fallback for unknown model')
     expect(fallback).toContain('/set-context-window')
     expect(fallback).toMatch(/Auto-compact at: +\S*off/)
     expect(fallback).toMatch(/Message-count at: +\S*1000\S* messages \(hard cap\)/)
+    expect(fallback).toContain('Last compaction:    none')
 
     const discovered = mod.renderCtxReport({
       ...input,
       contextWindowSource: 'discovery',
       messageCountCompactAt: 0,
       messageCountHardCap: 0,
+      lastCompaction: { trigger: 'auto', autoCompactReason: 'context-overflow' },
     })
     expect(discovered).toContain('Window source:      provider model discovery')
     expect(discovered).not.toContain('Model limit unknown')
     expect(discovered).toMatch(/Message-count at: +\S*off/)
+    // Provider-overflow recovery still compacts when auto-compact is off.
+    expect(discovered).toContain('Last compaction:    automatic (context-overflow recovery)')
+
+    const lastCompactionLine = (lastCompaction: RenderInput['lastCompaction']) =>
+      mod
+        .renderCtxReport({
+          ...input,
+          contextWindowSource: 'discovery',
+          messageCountCompactAt: 0,
+          messageCountHardCap: 0,
+          lastCompaction,
+        })
+        .split('\n')
+        .find(line => line.includes('Last compaction:'))
+    expect(lastCompactionLine({ trigger: 'manual' })).toContain('Last compaction:    manual')
+    expect(lastCompactionLine({ trigger: 'auto', autoCompactReason: 'message-count' })).toContain(
+      'automatic (message count)',
+    )
+    expect(lastCompactionLine({ trigger: 'auto', autoCompactReason: 'memory-pressure' })).toContain(
+      'automatic (memory pressure)',
+    )
+    // Boundaries written before the reason was recorded: say so, don't infer.
+    expect(lastCompactionLine({ trigger: 'auto' })).toContain('automatic (reason not recorded)')
   })
 })
