@@ -1,0 +1,49 @@
+name: win-repro
+
+# Windows repro workflow for fork-side verification (see AGENTS/CONTRIBUTING
+# for the upstream validation contract; this is a fork-only helper).
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or SHA to check out"
+        required: false
+        default: main
+      pwsh:
+        description: "PowerShell repro script (runs on Windows host)"
+        required: false
+        default: ""
+      buntest:
+        description: "bun test file paths (space separated)"
+        required: false
+        default: ""
+
+jobs:
+  repro:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install Bun
+        shell: pwsh
+        run: |
+          irm bun.sh/install.ps1 | iex
+          "C:\Users\runneradmin\.bun\bin" >> $env:GITHUB_PATH
+
+      - name: Install dependencies
+        shell: pwsh
+        run: bun install --frozen-lockfile
+
+      - name: Run bun tests
+        if: ${{ inputs.buntest != '' }}
+        shell: pwsh
+        run: bun test ${{ inputs.buntest }}
+
+      - name: Run PowerShell repro
+        if: ${{ inputs.pwsh != '' }}
+        shell: pwsh
+        run: |
+          ${{ inputs.pwsh }}
